@@ -1,54 +1,49 @@
-# -*- coding: utf-8 -*-
+# coding: utf-8
 from __future__ import unicode_literals
-import io
-import pickle
-
-from spacy.lemmatizer import Lemmatizer, read_index, read_exc
-from spacy.en import LOCAL_DATA_DIR
-from os import path
 
 import pytest
 
 
-def test_read_index():
-    wn = path.join(LOCAL_DATA_DIR, 'wordnet')
-    index = read_index(path.join(wn, 'index.noun'))
-    assert 'man' in index
-    assert 'plantes' not in index
-    assert 'plant' in index
+@pytest.mark.models
+@pytest.mark.parametrize('text,lemmas', [("aardwolves", ["aardwolf"]),
+                                         ("aardwolf", ["aardwolf"]),
+                                         ("planets", ["planet"]),
+                                         ("ring", ["ring"]),
+                                         ("axes", ["axis", "axe", "ax"])])
+def test_tagger_lemmatizer_noun_lemmas(lemmatizer, text, lemmas):
+    if lemmatizer is None:
+        return None
+    assert lemmatizer.noun(text) == set(lemmas)
 
 
-def test_read_exc():
-    wn = path.join(LOCAL_DATA_DIR, 'wordnet')
-    exc = read_exc(path.join(wn, 'verb.exc'))
-    assert exc['was'] == ('be',)
+@pytest.mark.xfail
+@pytest.mark.models
+def test_tagger_lemmatizer_base_forms(lemmatizer):
+    if lemmatizer is None:
+        return None
+    assert lemmatizer.noun('dive', {'number': 'sing'}) == set(['dive'])
+    assert lemmatizer.noun('dive', {'number': 'plur'}) == set(['diva'])
 
 
-@pytest.fixture
-def lemmatizer():
-    return Lemmatizer.from_dir(path.join(LOCAL_DATA_DIR))
+@pytest.mark.models
+def test_tagger_lemmatizer_base_form_verb(lemmatizer):
+    if lemmatizer is None:
+        return None
+    assert lemmatizer.verb('saw', {'verbform': 'past'}) == set(['see'])
 
 
-def test_noun_lemmas(lemmatizer):
-    do = lemmatizer.noun
-
-    assert do('aardwolves') == set(['aardwolf'])
-    assert do('aardwolf') == set(['aardwolf'])
-    assert do('planets') == set(['planet'])
-    assert do('ring') == set(['ring'])
-    assert do('axes') == set(['axis', 'axe', 'ax'])
+@pytest.mark.models
+def test_tagger_lemmatizer_punct(lemmatizer):
+    if lemmatizer is None:
+        return None
+    assert lemmatizer.punct('“') == set(['"'])
+    assert lemmatizer.punct('“') == set(['"'])
 
 
-def test_smart_quotes(lemmatizer):
-    do = lemmatizer.punct
-    assert do('“') == set(['"'])
-    assert do('“') == set(['"'])
-
-
-def test_pickle_lemmatizer(lemmatizer):
-    file_ = io.BytesIO()
-    pickle.dump(lemmatizer, file_)
-
-    file_.seek(0)
-    
-    loaded = pickle.load(file_)
+@pytest.mark.models
+def test_tagger_lemmatizer_lemma_assignment(EN):
+    text = "Bananas in pyjamas are geese."
+    doc = EN.tokenizer(text)
+    assert all(t.lemma_ == '' for t in doc)
+    EN.tagger(doc)
+    assert all(t.lemma_ != '' for t in doc)

@@ -5,9 +5,11 @@ from .parts_of_speech cimport univ_pos_t
 
 
 cdef struct LexemeC:
-    float* repvec
+    float* vector
 
     flags_t flags
+
+    attr_t lang
 
     attr_t id
     attr_t length
@@ -27,23 +29,14 @@ cdef struct LexemeC:
 
 
 cdef struct Entity:
+    hash_t id
     int start
     int end
     int label
 
 
-cdef struct Constituent:
-    const TokenC* head
-    const Constituent* parent
-    const Constituent* first
-    const Constituent* last
-    int label
-    int length
-
-
 cdef struct TokenC:
     const LexemeC* lex
-    const Constituent* ctnt
     uint64_t morph
     univ_pos_t pos
     bint spacy
@@ -61,4 +54,5 @@ cdef struct TokenC:
     uint32_t r_edge
 
     int ent_iob
-    int ent_type
+    int ent_type # TODO: Is there a better way to do this? Multiple sources of truth..
+    hash_t ent_id

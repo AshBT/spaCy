@@ -1,230 +1,231 @@
 #!/usr/bin/env python
-from setuptools import setup
-import shutil
-
-import sys
+from __future__ import print_function
+import io
 import os
-from os import path
-
-from setuptools import Extension
-from distutils import sysconfig
-from distutils.core import setup, Extension
+import subprocess
+import sys
+import contextlib
 from distutils.command.build_ext import build_ext
+from distutils.sysconfig import get_python_inc
+from distutils import ccompiler, msvccompiler
+from setuptools import Extension, setup, find_packages
 
-import platform
+
+PACKAGE_DATA = {'': ['*.pyx', '*.pxd', '*.txt', '*.tokens']}
+
+
+PACKAGES = find_packages()
+
+
+MOD_NAMES = [
+    'spacy.parts_of_speech',
+    'spacy.strings',
+    'spacy.lexeme',
+    'spacy.vocab',
+    'spacy.attrs',
+    'spacy.morphology',
+    'spacy.tagger',
+    'spacy.pipeline',
+    'spacy.syntax.stateclass',
+    'spacy.syntax._state',
+    'spacy.tokenizer',
+    'spacy.syntax.parser',
+    'spacy.syntax.beam_parser',
+    'spacy.syntax.nonproj',
+    'spacy.syntax.transition_system',
+    'spacy.syntax.arc_eager',
+    'spacy.syntax._parse_features',
+    'spacy.gold',
+    'spacy.orth',
+    'spacy.tokens.doc',
+    'spacy.tokens.span',
+    'spacy.tokens.token',
+    'spacy.serialize.packer',
+    'spacy.serialize.huffman',
+    'spacy.serialize.bits',
+    'spacy.cfile',
+    'spacy.matcher',
+    'spacy.syntax.ner',
+    'spacy.symbols',
+    'spacy.syntax.iterators']
+    # TODO: This is missing a lot of modules. Does it matter?
+
+
+COMPILE_OPTIONS =  {
+    'msvc': ['/Ox', '/EHsc'],
+    'mingw32' : ['-O3', '-Wno-strict-prototypes', '-Wno-unused-function'],
+    'other' : ['-O3', '-Wno-strict-prototypes', '-Wno-unused-function']
+}
+
+
+LINK_OPTIONS = {
+    'msvc' : [],
+    'mingw32': [],
+    'other' : []
+}
+
+
+# I don't understand this very well yet. See Issue #267
+# Fingers crossed!
+USE_OPENMP_DEFAULT = '1' if sys.platform != 'darwin' else None
+if os.environ.get('USE_OPENMP', USE_OPENMP_DEFAULT) == '1':
+    if sys.platform == 'darwin':
+        COMPILE_OPTIONS['other'].append('-fopenmp')
+        LINK_OPTIONS['other'].append('-fopenmp')
+        PACKAGE_DATA['spacy.platform.darwin.lib'] = ['*.dylib']
+        PACKAGES.append('spacy.platform.darwin.lib')
+
+    elif sys.platform == 'win32':
+        COMPILE_OPTIONS['msvc'].append('/openmp')
+
+    else:
+        COMPILE_OPTIONS['other'].append('-fopenmp')
+        LINK_OPTIONS['other'].append('-fopenmp')
+
 
 # By subclassing build_extensions we have the actual compiler that will be used which is really known only after finalize_options
 # http://stackoverflow.com/questions/724664/python-distutils-how-to-get-a-compiler-that-is-going-to-be-used
-compile_options =  {'msvc'  : ['/Ox', '/EHsc']  ,
-                    'other' : ['-O3', '-Wno-strict-prototypes', '-Wno-unused-function']       }
-link_options    =  {'msvc'  : [] ,
-                    'other' : [] }
 class build_ext_options:
     def build_options(self):
-        c_type = None
-        if self.compiler.compiler_type in compile_options:
-            c_type = self.compiler.compiler_type
-        elif 'other' in compile_options:
-            c_type = 'other'
-        if c_type is not None:
-           for e in self.extensions:
-               e.extra_compile_args = compile_options[c_type]
+        for e in self.extensions:
+            e.extra_compile_args += COMPILE_OPTIONS.get(
+                self.compiler.compiler_type, COMPILE_OPTIONS['other'])
+        for e in self.extensions:
+            e.extra_link_args += LINK_OPTIONS.get(
+                self.compiler.compiler_type, LINK_OPTIONS['other'])
 
-        l_type = None 
-        if self.compiler.compiler_type in link_options:
-            l_type = self.compiler.compiler_type
-        elif 'other' in link_options:
-            l_type = 'other'
-        if l_type is not None:
-           for e in self.extensions:
-               e.extra_link_args = link_options[l_type]
 
-class build_ext_subclass( build_ext, build_ext_options ):
+class build_ext_subclass(build_ext, build_ext_options):
     def build_extensions(self):
         build_ext_options.build_options(self)
         build_ext.build_extensions(self)
-        
-    
-
-# PyPy --- NB! PyPy doesn't really work, it segfaults all over the place. But,
-# this is necessary to get it compile.
-# We have to resort to monkey-patching to set the compiler, because pypy broke
-# all the everything.
-
-pre_patch_customize_compiler = sysconfig.customize_compiler
-def my_customize_compiler(compiler):
-    pre_patch_customize_compiler(compiler)
-    compiler.compiler_cxx = ['c++']
 
 
-if platform.python_implementation() == 'PyPy':
-    sysconfig.customize_compiler = my_customize_compiler
-
-#def install_headers():
-#    dest_dir = path.join(sys.prefix, 'include', 'murmurhash')
-#    if not path.exists(dest_dir):
-#        shutil.copytree('murmurhash/headers/murmurhash', dest_dir)
-#
-#    dest_dir = path.join(sys.prefix, 'include', 'numpy')
+def generate_cython(root, source):
+    print('Cythonizing sources')
+    p = subprocess.call([sys.executable,
+                         os.path.join(root, 'bin', 'cythonize.py'),
+                         source], env=os.environ)
+    if p != 0:
+        raise RuntimeError('Running cythonize failed')
 
 
-includes = ['.', path.join(sys.prefix, 'include')]
+def is_source_release(path):
+    return os.path.exists(os.path.join(path, 'PKG-INFO'))
 
 
-try:
-    import numpy
-    numpy_headers = path.join(numpy.get_include(), 'numpy')
-    shutil.copytree(numpy_headers, path.join(sys.prefix, 'include', 'numpy'))
-except ImportError:
-    pass
-except OSError:
-    pass
-
-
-def clean(mod_names):
-    for name in mod_names:
+def clean(path):
+    for name in MOD_NAMES:
         name = name.replace('.', '/')
-        so = name + '.so'
-        html = name + '.html'
-        cpp = name + '.cpp'
-        c = name + '.c'
-        for file_path in [so, html, cpp, c]:
+        for ext in ['.so', '.html', '.cpp', '.c']:
+            file_path = os.path.join(path, name + ext)
             if os.path.exists(file_path):
                 os.unlink(file_path)
 
 
-def name_to_path(mod_name, ext):
-    return '%s.%s' % (mod_name.replace('.', '/'), ext)
+@contextlib.contextmanager
+def chdir(new_dir):
+    old_dir = os.getcwd()
+    try:
+        os.chdir(new_dir)
+        sys.path.insert(0, new_dir)
+        yield
+    finally:
+        del sys.path[0]
+        os.chdir(old_dir)
 
 
-def c_ext(mod_name, language, includes):
-    mod_path = name_to_path(mod_name, language)
-    return Extension(mod_name, [mod_path], include_dirs=includes)
+def setup_package():
+    root = os.path.abspath(os.path.dirname(__file__))
 
+    if len(sys.argv) > 1 and sys.argv[1] == 'clean':
+        return clean(root)
 
-def cython_setup(mod_names, language, includes):
-    import Cython.Distutils
-    import Cython.Build
-    import distutils.core
+    with chdir(root):
+        with io.open(os.path.join(root, 'spacy', 'about.py'), encoding='utf8') as f:
+            about = {}
+            exec(f.read(), about)
 
-    class build_ext_cython_subclass( Cython.Distutils.build_ext, build_ext_options ):
-        def build_extensions(self):
-            build_ext_options.build_options(self)
-            Cython.Distutils.build_ext.build_extensions(self)
+        with io.open(os.path.join(root, 'README.rst'), encoding='utf8') as f:
+            readme = f.read()
 
-    if language == 'cpp':
-        language = 'c++'
-    exts = []
-    for mod_name in mod_names:
-        mod_path = mod_name.replace('.', '/') + '.pyx'
-        e = Extension(mod_name, [mod_path], language=language, include_dirs=includes)
-        exts.append(e)
-    distutils.core.setup(
-        name='spacy',
-        packages=['spacy', 'spacy.tokens', 'spacy.en', 'spacy.serialize',
-                  'spacy.syntax', 'spacy.munge'],
-        description="Industrial-strength NLP",
-        author='Matthew Honnibal',
-        author_email='honnibal@gmail.com',
-        version=VERSION,
-        url="http://honnibal.github.io/spaCy/",
-        package_data={"spacy": ["*.pxd", "tests/*.py", "tests/*/*.py"],
-                      "spacy.tokens": ["*.pxd"],
-                      "spacy.serialize": ["*.pxd"],
-                      "spacy.en": ["*.pxd", "data/pos/*",
-                                   "data/wordnet/*", "data/tokenizer/*",
-                                   "data/vocab/tag_map.json",
-                                   "data/vocab/lexemes.bin",
-                                   "data/vocab/strings.json"],
-                      "spacy.syntax": ["*.pxd"]},
-        ext_modules=exts,
-        cmdclass={'build_ext': build_ext_cython_subclass},
-        license="MIT",
-    )
+        include_dirs = [
+            get_python_inc(plat_specific=True),
+            os.path.join(root, 'include')]
 
+        if (ccompiler.new_compiler().compiler_type == 'msvc'
+        and msvccompiler.get_build_version() == 9):
+            include_dirs.append(os.path.join(root, 'include', 'msvc9'))
 
-def run_setup(exts):
-    setup(
-        name='spacy',
-        packages=['spacy', 'spacy.tokens', 'spacy.en', 'spacy.serialize',
-                  'spacy.syntax', 'spacy.munge',
-                  'spacy.tests',
-                  'spacy.tests.matcher',
-                  'spacy.tests.morphology',
-                  'spacy.tests.munge',
-                  'spacy.tests.parser',
-                  'spacy.tests.serialize',
-                  'spacy.tests.spans',
-                  'spacy.tests.tagger',
-                  'spacy.tests.tokenizer',
-                  'spacy.tests.tokens',
-                  'spacy.tests.vectors',
-                  'spacy.tests.vocab'],
-        description="Industrial-strength NLP",
-        author='Matthew Honnibal',
-        author_email='honnibal@gmail.com',
-        version=VERSION,
-        url="http://honnibal.github.io/spaCy/",
-        package_data={"spacy": ["*.pxd"],
-                      "spacy.en": ["*.pxd", "data/pos/*",
-                                   "data/wordnet/*", "data/tokenizer/*",
-                                   "data/vocab/lexemes.bin",
-                                   "data/vocab/serializer.json",
-                                   "data/vocab/oov_prob",
-                                   "data/vocab/strings.txt"],
-                      "spacy.syntax": ["*.pxd"]},
-        ext_modules=exts,
-        license="MIT",
-        install_requires=['numpy', 'murmurhash', 'cymem >= 1.11', 'preshed >= 0.42',
-                          'thinc == 3.3', "text_unidecode", 'plac', 'six',
-                          'ujson', 'cloudpickle'],
-        setup_requires=["headers_workaround"],
-        cmdclass = {'build_ext': build_ext_subclass },
-    )
+        ext_modules = []
+        for mod_name in MOD_NAMES:
+            mod_path = mod_name.replace('.', '/') + '.cpp'
+            extra_link_args = []
+            # ???
+            # Imported from patch from @mikepb
+            # See Issue #267. Running blind here...
+            if sys.platform == 'darwin':
+                dylib_path = ['..' for _ in range(mod_name.count('.'))]
+                dylib_path = '/'.join(dylib_path)
+                dylib_path = '@loader_path/%s/spacy/platform/darwin/lib' % dylib_path
+                extra_link_args.append('-Wl,-rpath,%s' % dylib_path)
+            ext_modules.append(
+                Extension(mod_name, [mod_path],
+                    language='c++', include_dirs=include_dirs,
+                    extra_link_args=extra_link_args))
 
-    import headers_workaround
+        if not is_source_release(root):
+            generate_cython(root, 'spacy')
 
-    headers_workaround.fix_venv_pypy_include()
-    headers_workaround.install_headers('murmurhash')
-    headers_workaround.install_headers('numpy')
-
-
-VERSION = '0.97'
-def main(modules, is_pypy):
-    language = "cpp"
-    includes = ['.', path.join(sys.prefix, 'include')]
-    if sys.platform.startswith('darwin'):
-        compile_options['other'].append('-mmacosx-version-min=10.8')
-        compile_options['other'].append('-stdlib=libc++')
-        link_options['other'].append('-lc++')
-    if use_cython:
-        cython_setup(modules, language, includes)
-    else:
-        exts = [c_ext(mn, language, includes)
-                      for mn in modules]
-        run_setup(exts)
-
-MOD_NAMES = ['spacy.parts_of_speech', 'spacy.strings',
-             'spacy.lexeme', 'spacy.vocab', 'spacy.attrs',
-             'spacy.morphology', 'spacy.tagger',
-             'spacy.syntax.stateclass', 
-             'spacy._ml', 'spacy._theano',
-             'spacy.tokenizer',
-             'spacy.syntax.parser', 
-             'spacy.syntax.transition_system',
-             'spacy.syntax.arc_eager',
-             'spacy.syntax._parse_features',
-             'spacy.gold', 'spacy.orth',
-             'spacy.tokens.doc', 'spacy.tokens.spans', 'spacy.tokens.token',
-             'spacy.serialize.packer', 'spacy.serialize.huffman', 'spacy.serialize.bits',
-             'spacy.cfile', 'spacy.matcher',
-             'spacy.syntax.ner',
-             'spacy.symbols']
+        setup(
+            name=about['__title__'],
+            zip_safe=False,
+            packages=PACKAGES,
+            package_data=PACKAGE_DATA,
+            description=about['__summary__'],
+            long_description=readme,
+            author=about['__author__'],
+            author_email=about['__email__'],
+            version=about['__version__'],
+            url=about['__uri__'],
+            license=about['__license__'],
+            ext_modules=ext_modules,
+            install_requires=[
+                'numpy>=1.7',
+                'murmurhash>=0.26,<0.27',
+                'cymem>=1.30,<1.32',
+                'preshed>=1.0.0,<2.0.0',
+                'thinc>=6.5.0,<6.6.0',
+                'plac<1.0.0,>=0.9.6',
+                'pip>=9.0.0,<10.0.0',
+                'six',
+                'pathlib',
+                'ujson>=1.35',
+                'dill>=0.2,<0.3',
+                'requests>=2.13.0,<3.0.0',
+                'regex>=2017.4.1,<2017.12.1',
+                'ftfy>=4.4.2,<5.0.0'],
+            classifiers=[
+                'Development Status :: 5 - Production/Stable',
+                'Environment :: Console',
+                'Intended Audience :: Developers',
+                'Intended Audience :: Science/Research',
+                'License :: OSI Approved :: MIT License',
+                'Operating System :: POSIX :: Linux',
+                'Operating System :: MacOS :: MacOS X',
+                'Operating System :: Microsoft :: Windows',
+                'Programming Language :: Cython',
+                'Programming Language :: Python :: 2.6',
+                'Programming Language :: Python :: 2.7',
+                'Programming Language :: Python :: 3.3',
+                'Programming Language :: Python :: 3.4',
+                'Programming Language :: Python :: 3.5',
+                'Programming Language :: Python :: 3.6',
+                'Topic :: Scientific/Engineering'],
+            cmdclass = {
+                'build_ext': build_ext_subclass},
+        )
 
 
 if __name__ == '__main__':
-    if sys.argv[1] == 'clean':
-        clean(MOD_NAMES)
-    else:
-        use_cython = sys.argv[1] == 'build_ext'
-        main(MOD_NAMES, use_cython)
+    setup_package()

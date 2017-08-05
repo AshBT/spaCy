@@ -1,27 +1,32 @@
 language: python
 
+sudo: false
+dist: trusty
+group: edge
+
+python:
+   - "2.7"
+   - "3.6"
+
 os:
   - linux
 
-python:
-  - "2.7"
-  - "3.4"
+env:
+  - VIA=compile LC_ALL=en_US.ascii 
+  - VIA=compile
 
-# install dependencies
+#  - VIA=sdist
+
 install:
-  - "pip install --upgrade setuptools"
-  - "pip install cython fabric fabtools"
-  - "pip install -r requirements.txt"
-  - "python setup.py build_ext --inplace"
-  - "mkdir -p corpora/en"
-  - "cd corpora/en"
-  - "wget --no-check-certificate http://wordnetcode.princeton.edu/3.0/WordNet-3.0.tar.gz"
-  - "tar -xzf WordNet-3.0.tar.gz"
-  - "mv WordNet-3.0 wordnet"
-  - "cd ../../"
-  - "export PYTHONPATH=`pwd`"
-  - "python bin/init_model.py en lang_data/ corpora/ spacy/en/data"
+  - "./travis.sh"
 
-# run tests
 script:
-  - "py.test spacy/ -x"
+  - "pip install pytest pytest-timeout"
+  - if [[ "${VIA}" == "compile" ]]; then python -m pytest --tb=native spacy; fi
+  - if [[ "${VIA}" == "pypi" ]]; then python -m pytest --tb=native `python -c "import os.path; import spacy; print(os.path.abspath(ospath.dirname(spacy.__file__)))"`; fi
+  - if [[ "${VIA}" == "sdist" ]]; then python -m pytest --tb=native `python -c "import os.path; import spacy; print(os.path.abspath(os.path.dirname(spacy.__file__)))"`; fi
+  
+notifications:
+  slack:
+    secure: F8GvqnweSdzImuLL64TpfG0i5rYl89liyr9tmFVsHl4c0DNiDuGhZivUz0M1broS8svE3OPOllLfQbACG/4KxD890qfF9MoHzvRDlp7U+RtwMV/YAkYn8MGWjPIbRbX0HpGdY7O2Rc9Qy4Kk0T8ZgiqXYIqAz2Eva9/9BlSmsJQ=
+  email: false

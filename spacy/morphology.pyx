@@ -1,31 +1,56 @@
-from os import path
-from .lemmatizer import Lemmatizer
+# cython: infer_types
+# coding: utf8
+from __future__ import unicode_literals
 
-try:
-    import ujson as json
-except ImportError:
-    import json
+from libc.string cimport memset
 
-from .parts_of_speech import IDS as POS_IDS
 from .parts_of_speech cimport ADJ, VERB, NOUN, PUNCT
+from .attrs cimport POS, IS_SPACE
+from .parts_of_speech import IDS as POS_IDS
+from .lexeme cimport Lexeme
+from .attrs import LEMMA, intify_attrs
+
+
+def _normalize_props(props):
+    """
+    Transform deprecated string keys to correct names.
+    """
+    out = {}
+    for key, value in props.items():
+        if key == POS:
+            if hasattr(value, 'upper'):
+                value = value.upper()
+            if value in POS_IDS:
+                value = POS_IDS[value]
+            out[key] = value
+        elif isinstance(key, int):
+            out[key] = value
+        elif key.lower() == 'pos':
+            out[POS] = POS_IDS[value.upper()]
+        else:
+            out[key] = value
+    return out
 
 
 cdef class Morphology:
     def __init__(self, StringStore string_store, tag_map, lemmatizer):
         self.mem = Pool()
         self.strings = string_store
-        self.tag_map = tag_map
+        self.tag_map = {}
         self.lemmatizer = lemmatizer
         self.n_tags = len(tag_map) + 1
         self.tag_names = tuple(sorted(tag_map.keys()))
         self.reverse_index = {}
-        
+
         self.rich_tags = <RichTagC*>self.mem.alloc(self.n_tags, sizeof(RichTagC))
-        for i, (tag_str, props) in enumerate(sorted(tag_map.items())):
+        for i, (tag_str, attrs) in enumerate(sorted(tag_map.items())):
+            attrs = _normalize_props(attrs)
+            self.tag_map[tag_str] = dict(attrs)
+            attrs = intify_attrs(attrs, self.strings, _do_deprecated=True)
             self.rich_tags[i].id = i
             self.rich_tags[i].name = self.strings[tag_str]
             self.rich_tags[i].morph = 0
-            self.rich_tags[i].pos = POS_IDS[props['pos'].upper()]
+            self.rich_tags[i].pos = attrs[POS]
             self.reverse_index[self.rich_tags[i].name] = i
         self._cache = PreshMapArray(self.n_tags)
 
@@ -33,66 +58,98 @@ cdef class Morphology:
         return (Morphology, (self.strings, self.tag_map, self.lemmatizer), None, None)
 
     cdef int assign_tag(self, TokenC* token, tag) except -1:
-        cdef int tag_id
         if isinstance(tag, basestring):
             tag_id = self.reverse_index[self.strings[tag]]
         else:
-            tag_id = tag
+            tag_id = self.reverse_index[tag]
+        self.assign_tag_id(token, tag_id)
+
+    cdef int assign_tag_id(self, TokenC* token, int tag_id) except -1:
+        if tag_id >= self.n_tags:
+            raise ValueError("Unknown tag ID: %s" % tag_id)
+        # TODO: It's pretty arbitrary to put this logic here. I guess the justification
+        # is that this is where the specific word and the tag interact. Still,
+        # we should have a better way to enforce this rule, or figure out why
+        # the statistical model fails.
+        # Related to Issue #220
+        if Lexeme.c_check_flag(token.lex, IS_SPACE):
+            tag_id = self.reverse_index[self.strings['SP']]
+        rich_tag = self.rich_tags[tag_id]
         analysis = <MorphAnalysisC*>self._cache.get(tag_id, token.lex.orth)
         if analysis is NULL:
             analysis = <MorphAnalysisC*>self.mem.alloc(1, sizeof(MorphAnalysisC))
-            analysis.tag = self.rich_tags[tag_id]
-            analysis.lemma = self.lemmatize(analysis.tag.pos, token.lex.orth)
+            tag_str = self.strings[self.rich_tags[tag_id].name]
+            analysis.tag = rich_tag
+            analysis.lemma = self.lemmatize(analysis.tag.pos, token.lex.orth,
+                                            self.tag_map.get(tag_str, {}))
             self._cache.set(tag_id, token.lex.orth, analysis)
         token.lemma = analysis.lemma
         token.pos = analysis.tag.pos
         token.tag = analysis.tag.name
         token.morph = analysis.tag.morph
 
-    cdef int assign_feature(self, uint64_t* morph, feature, value) except -1:
-        pass
+    cdef int assign_feature(self, uint64_t* flags, univ_morph_t flag_id, bint value) except -1:
+        cdef flags_t one = 1
+        if value:
+            flags[0] |= one << flag_id
+        else:
+            flags[0] &= ~(one << flag_id)
+
+    def add_special_case(self, unicode tag_str, unicode orth_str, attrs, force=False):
+        """
+        Add a special-case rule to the morphological analyser. Tokens whose
+        tag and orth match the rule will receive the specified properties.
+
+        Arguments:
+            tag (unicode): The part-of-speech tag to key the exception.
+            orth (unicode): The word-form to key the exception.
+        """
+        tag = self.strings[tag_str]
+        tag_id = self.reverse_index[tag]
+        orth = self.strings[orth_str]
+        cdef RichTagC rich_tag = self.rich_tags[tag_id]
+        attrs = intify_attrs(attrs, self.strings, _do_deprecated=True)
+        cached = <MorphAnalysisC*>self._cache.get(tag_id, orth)
+        if cached is NULL:
+            cached = <MorphAnalysisC*>self.mem.alloc(1, sizeof(MorphAnalysisC))
+        elif force:
+            memset(cached, 0, sizeof(cached[0]))
+        else:
+            msg = ("Conflicting morphology exception for (%s, %s). Use force=True "
+                   "to overwrite.")
+            msg = msg % (tag_str, orth_str)
+            raise ValueError(msg)
+
+        cached.tag = rich_tag
+        # TODO: Refactor this to take arbitrary attributes.
+        for name_id, value_id in attrs.items():
+            if name_id == LEMMA:
+                cached.lemma = value_id
+            else:
+                self.assign_feature(&cached.tag.morph, name_id, value_id)
+        if cached.lemma == 0:
+            cached.lemma = self.lemmatize(rich_tag.pos, orth, attrs)
+        self._cache.set(tag_id, orth, <void*>cached)
 
     def load_morph_exceptions(self, dict exc):
         # Map (form, pos) to (lemma, rich tag)
-        cdef unicode pos_str
-        cdef unicode form_str
-        cdef unicode lemma_str
-        cdef dict entries
-        cdef dict props
-        cdef int lemma
-        cdef attr_t orth
-        cdef attr_t tag_id
-        cdef int pos
-        cdef RichTagC rich_tag
         for tag_str, entries in exc.items():
-            tag = self.strings[tag_str]
-            tag_id = self.reverse_index[tag] 
-            rich_tag = self.rich_tags[tag_id]
-            for form_str, props in entries.items():
-                cached = <MorphAnalysisC*>self.mem.alloc(1, sizeof(MorphAnalysisC))
-                cached.tag = rich_tag
-                orth = self.strings[form_str]
-                for name_str, value_str in props.items():
-                    if name_str == 'L':
-                        cached.lemma = self.strings[value_str]
-                    else:
-                        self.assign_feature(&cached.tag.morph, name_str, value_str)
-                if cached.lemma == 0:
-                    cached.lemma = self.lemmatize(rich_tag.pos, orth)
-                self._cache.set(tag_id, orth, <void*>cached)
+            for form_str, attrs in entries.items():
+                self.add_special_case(tag_str, form_str, attrs)
 
-    def lemmatize(self, const univ_pos_t pos, attr_t orth):
-        if self.lemmatizer is None:
-            return orth
+    def lemmatize(self, const univ_pos_t univ_pos, attr_t orth, morphology):
         cdef unicode py_string = self.strings[orth]
-        if pos != NOUN and pos != VERB and pos != ADJ and pos != PUNCT:
-            return orth
+        if self.lemmatizer is None:
+            return self.strings[py_string.lower()]
+        if univ_pos not in (NOUN, VERB, ADJ, PUNCT):
+            return self.strings[py_string.lower()]
         cdef set lemma_strings
         cdef unicode lemma_string
-        lemma_strings = self.lemmatizer(py_string, pos)
+        lemma_strings = self.lemmatizer(py_string, univ_pos, morphology)
         lemma_string = sorted(lemma_strings)[0]
         lemma = self.strings[lemma_string]
         return lemma
+
 
 IDS = {
     "Animacy_anim": Animacy_anim,
@@ -132,6 +189,7 @@ IDS = {
     "Definite_two": Definite_two,
     "Definite_def": Definite_def,
     "Definite_red": Definite_red,
+    "Definite_cons": Definite_cons, # U20
     "Definite_ind": Definite_ind,
     "Degree_cmp": Degree_cmp,
     "Degree_comp": Degree_comp,
@@ -155,6 +213,8 @@ IDS = {
     "Negative_neg": Negative_neg,
     "Negative_pos": Negative_pos,
     "Negative_yes": Negative_yes,
+    "Polarity_neg": Polarity_neg, # U20
+    "Polarity_pos": Polarity_pos, # U20
     "Number_com": Number_com,
     "Number_dual": Number_dual,
     "Number_none": Number_none,
@@ -203,6 +263,7 @@ IDS = {
     "VerbForm_partPres": VerbForm_partPres,
     "VerbForm_sup": VerbForm_sup,
     "VerbForm_trans": VerbForm_trans,
+    "VerbForm_conv": VerbForm_conv, # U20
     "VerbForm_gdv ": VerbForm_gdv, # la,
     "Voice_act": Voice_act,
     "Voice_cau": Voice_cau,

@@ -1,151 +1,139 @@
+from __future__ import unicode_literals
 import plac
 import json
-from os import path
-import shutil
-import os
 import random
+import pathlib
 
-from spacy.syntax.util import Config
-from spacy.gold import GoldParse
-from spacy.tokenizer import Tokenizer
-from spacy.vocab import Vocab
-from spacy.tagger import Tagger
-from spacy.syntax.parser import Parser
-from spacy.syntax.arc_eager import ArcEager
-from spacy.syntax.parser import get_templates
-from spacy.scorer import Scorer
-
+from spacy.tokens import Doc
+from spacy.syntax.nonproj import PseudoProjectivity
 from spacy.language import Language
-
-from spacy.tagger import W_orth
-
-TAGGER_TEMPLATES = (
-    (W_orth,),
-)
-
-try:
-    from codecs import open
-except ImportError:
-    pass
+from spacy.gold import GoldParse
+from spacy.tagger import Tagger
+from spacy.pipeline import DependencyParser, BeamDependencyParser
+from spacy.syntax.parser import get_templates
+from spacy.syntax.arc_eager import ArcEager
+from spacy.scorer import Scorer
+from spacy.language_data.tag_map import TAG_MAP as DEFAULT_TAG_MAP
+import spacy.attrs
+import io
 
 
-class TreebankParser(object):
-    @staticmethod
-    def setup_model_dir(model_dir, labels, templates, feat_set='basic', seed=0):
-        dep_model_dir = path.join(model_dir, 'deps')
-        pos_model_dir = path.join(model_dir, 'pos')
-        if path.exists(dep_model_dir):
-            shutil.rmtree(dep_model_dir)
-        if path.exists(pos_model_dir):
-            shutil.rmtree(pos_model_dir)
-        os.mkdir(dep_model_dir)
-        os.mkdir(pos_model_dir)
-
-        Config.write(dep_model_dir, 'config', features=feat_set, seed=seed,
-                     labels=labels)
-
-    @classmethod
-    def from_dir(cls, tag_map, model_dir):
-        vocab = Vocab(tag_map=tag_map, get_lex_attr=Language.default_lex_attrs())
-        tokenizer = Tokenizer(vocab, {}, None, None, None)
-        tagger = Tagger.blank(vocab, TAGGER_TEMPLATES)
-
-        cfg = Config.read(path.join(model_dir, 'deps'), 'config')
-        parser = Parser.from_dir(path.join(model_dir, 'deps'), vocab.strings, ArcEager)
-        return cls(vocab, tokenizer, tagger, parser)
-
-    def __init__(self, vocab, tokenizer, tagger, parser):
-        self.vocab = vocab
-        self.tokenizer = tokenizer
-        self.tagger = tagger
-        self.parser = parser
-
-    def train(self, words, tags, heads, deps):
-        tokens = self.tokenizer.tokens_from_list(list(words))
-        self.tagger.train(tokens, tags)
-        
-        tokens = self.tokenizer.tokens_from_list(list(words))
-        ids = range(len(words))
-        ner = ['O'] * len(words)
-        gold = GoldParse(tokens, ((ids, words, tags, heads, deps, ner)),
-                         make_projective=False)
-        self.tagger(tokens)
-        if gold.is_projective:
-            try:
-                self.parser.train(tokens, gold)
-            except:
-                for id_, word, head, dep in zip(ids, words, heads, deps):
-                    print(id_, word, head, dep)
-                raise
-
-    def __call__(self, words, tags=None):
-        tokens = self.tokenizer.tokens_from_list(list(words))
-        if tags is None:
-            self.tagger(tokens)
-        else:
-            self.tagger.tag_from_strings(tokens, tags)
-        self.parser(tokens)
-        return tokens
-
-    def end_training(self, data_dir):
-        self.parser.model.end_training(path.join(data_dir, 'deps', 'model'))
-        self.tagger.model.end_training(path.join(data_dir, 'pos', 'model'))
-        self.vocab.strings.dump(path.join(data_dir, 'vocab', 'strings.txt'))
- 
-
-def read_conllx(loc):
-    with open(loc, 'r', 'utf8') as file_:
+def read_conllx(loc, n=0):
+    with io.open(loc, 'r', encoding='utf8') as file_:
         text = file_.read()
+    i = 0
     for sent in text.strip().split('\n\n'):
         lines = sent.strip().split('\n')
         if lines:
-            if lines[0].startswith('#'):
+            while lines[0].startswith('#'):
                 lines.pop(0)
             tokens = []
             for line in lines:
-                id_, word, lemma, pos, tag, morph, head, dep, _1, _2 = line.split()
-                if '-' in id_:
+                id_, word, lemma, pos, tag, morph, head, dep, _1, \
+                _2 = line.split('\t')
+                if '-' in id_ or '.' in id_:
                     continue
-                id_ = int(id_) - 1
-                head = (int(head) - 1) if head != '0' else id_
-                dep = 'ROOT' if dep == 'root' else dep
-                tokens.append((id_, word, tag, head, dep, 'O'))
-            tuples = zip(*tokens)
-            yield (None, [(tuples, [])])
+                try:
+                    id_ = int(id_) - 1
+                    head = (int(head) - 1) if head != '0' else id_
+                    dep = 'ROOT' if dep == 'root' else dep
+                    tokens.append((id_, word, tag, head, dep, 'O'))
+                except:
+                    print(line)
+                    raise
+            tuples = [list(t) for t in zip(*tokens)]
+            yield (None, [[tuples, []]])
+            i += 1
+            if n >= 1 and i >= n:
+                break
 
 
-def score_model(nlp, gold_docs, verbose=False):
+def score_model(vocab, tagger, parser, gold_docs, verbose=False):
     scorer = Scorer()
     for _, gold_doc in gold_docs:
-        for annot_tuples, _ in gold_doc:
-            tokens = nlp(list(annot_tuples[1]), tags=list(annot_tuples[2]))
-            gold = GoldParse(tokens, annot_tuples)
-            scorer.score(tokens, gold, verbose=verbose)
+        for (ids, words, tags, heads, deps, entities), _ in gold_doc:
+            doc = Doc(vocab, words=words)
+            tagger(doc)
+            parser(doc)
+            PseudoProjectivity.deprojectivize(doc)
+            gold = GoldParse(doc, tags=tags, heads=heads, deps=deps)
+            scorer.score(doc, gold, verbose=verbose)
     return scorer
 
 
-def main(train_loc, dev_loc, model_dir, tag_map_loc):
-    with open(tag_map_loc) as file_:
-        tag_map = json.loads(file_.read())
+def main(lang_name, train_loc, dev_loc, model_dir, clusters_loc=None):
+    LangClass = spacy.util.get_lang_class(lang_name)
     train_sents = list(read_conllx(train_loc))
-    labels = ArcEager.get_labels(train_sents)
-    templates = get_templates('basic')
+    train_sents = PseudoProjectivity.preprocess_training_data(train_sents)
 
-    TreebankParser.setup_model_dir(model_dir, labels, templates)
-    
-    nlp = TreebankParser.from_dir(tag_map, model_dir)
+    actions = ArcEager.get_actions(gold_parses=train_sents)
+    features = get_templates('basic')
 
-    for itn in range(15):
+    model_dir = pathlib.Path(model_dir)
+    if not model_dir.exists():
+        model_dir.mkdir()
+    if not (model_dir / 'deps').exists():
+        (model_dir / 'deps').mkdir()
+    if not (model_dir / 'pos').exists():
+        (model_dir / 'pos').mkdir()
+    with (model_dir / 'deps' / 'config.json').open('wb') as file_:
+        file_.write(
+            json.dumps(
+                {'pseudoprojective': True, 'labels': actions, 'features': features}).encode('utf8'))
+
+    vocab = LangClass.Defaults.create_vocab()
+    if not (model_dir / 'vocab').exists():
+        (model_dir / 'vocab').mkdir()
+    else:
+        if (model_dir / 'vocab' / 'strings.json').exists():
+            with (model_dir / 'vocab' / 'strings.json').open() as file_:
+                vocab.strings.load(file_)
+            if (model_dir / 'vocab' / 'lexemes.bin').exists():
+                vocab.load_lexemes(model_dir / 'vocab' / 'lexemes.bin')
+
+    if clusters_loc is not None:
+        clusters_loc = pathlib.Path(clusters_loc)
+        with clusters_loc.open() as file_:
+            for line in file_:
+                try:
+                    cluster, word, freq = line.split()
+                except ValueError:
+                    continue
+                lex = vocab[word]
+                lex.cluster = int(cluster[::-1], 2)
+    # Populate vocab
+    for _, doc_sents in train_sents:
+        for (ids, words, tags, heads, deps, ner), _ in doc_sents:
+            for word in words:
+                _ = vocab[word]
+            for dep in deps:
+                _ = vocab[dep]
+            for tag in tags:
+                _ = vocab[tag]
+            if vocab.morphology.tag_map:
+                for tag in tags:
+                    assert tag in vocab.morphology.tag_map, repr(tag)
+    tagger = Tagger(vocab)
+    parser = DependencyParser(vocab, actions=actions, features=features, L1=0.0)
+
+    for itn in range(30):
+        loss = 0.
         for _, doc_sents in train_sents:
             for (ids, words, tags, heads, deps, ner), _ in doc_sents:
-                nlp.train(words, tags, heads, deps)
+                doc = Doc(vocab, words=words)
+                gold = GoldParse(doc, tags=tags, heads=heads, deps=deps)
+                tagger(doc)
+                loss += parser.update(doc, gold, itn=itn)
+                doc = Doc(vocab, words=words)
+                tagger.update(doc, gold)
         random.shuffle(train_sents)
-        scorer = score_model(nlp, read_conllx(dev_loc))
-        print('%d:\t%.3f\t%.3f' % (itn, scorer.uas, scorer.tags_acc))
+        scorer = score_model(vocab, tagger, parser, read_conllx(dev_loc))
+        print('%d:\t%.3f\t%.3f\t%.3f' % (itn, loss, scorer.uas, scorer.tags_acc))
+    nlp = LangClass(vocab=vocab, tagger=tagger, parser=parser)
     nlp.end_training(model_dir)
-    scorer = score_model(nlp, read_conllx(dev_loc))
+    scorer = score_model(vocab, tagger, parser, read_conllx(dev_loc))
     print('%d:\t%.3f\t%.3f\t%.3f' % (itn, scorer.uas, scorer.las, scorer.tags_acc))
- 
+
 
 if __name__ == '__main__':
     plac.call(main)

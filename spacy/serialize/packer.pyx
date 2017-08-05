@@ -100,6 +100,8 @@ cdef class Packer:
         self.attrs = tuple(attrs)
 
     def pack(self, Doc doc):
+        if len(doc) == 0:
+            return b''
         bits = self._orth_encode(doc)
         if bits is None:
             bits = self._char_encode(doc)
@@ -116,6 +118,8 @@ cdef class Packer:
         return doc
 
     def unpack_into(self, byte_string, Doc doc):
+        if byte_string == b'':
+            return None
         bits = BitArray(byte_string)
         bits.seek(0)
         cdef int32_t length = bits.read32()
@@ -123,11 +127,9 @@ cdef class Packer:
             self._orth_decode(bits, length, doc)
         else:
             self._char_decode(bits, -length, doc)
-        
         array = numpy.zeros(shape=(len(doc), len(self._codecs)), dtype=numpy.int32)
         for i, codec in enumerate(self._codecs):
             codec.decode(bits, array[:, i])
-
         doc.from_array(self.attrs, array)
         return doc
 
@@ -155,10 +157,10 @@ cdef class Packer:
         self.char_codec.encode(bytearray(utf8_str), bits)
         cdef int i, j
         for i in range(doc.length):
-            for j in range(doc.data[i].lex.length-1):
+            for j in range(doc.c[i].lex.length-1):
                 bits.append(False)
             bits.append(True)
-            if doc.data[i].spacy:
+            if doc.c[i].spacy:
                 bits.append(False)
         return bits
 

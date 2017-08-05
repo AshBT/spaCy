@@ -7,15 +7,16 @@ out of "context") is in features/extractor.pyx
 The atomic feature names are listed in a big enum, so that the feature tuples
 can refer to them.
 """
-from libc.string cimport memset
+# coding: utf-8
+from __future__ import unicode_literals
 
+from libc.string cimport memset
 from itertools import combinations
+from cymem.cymem cimport Pool
 
 from ..structs cimport TokenC
-
 from .stateclass cimport StateClass
-
-from cymem.cymem cimport Pool
+from ._state cimport StateC
 
 
 cdef inline void fill_token(atom_t* context, const TokenC* token) nogil:
@@ -32,7 +33,6 @@ cdef inline void fill_token(atom_t* context, const TokenC* token) nogil:
         context[9] = 0
         context[10] = 0
         context[11] = 0
-        context[12] = 0
     else:
         context[0] = token.lex.orth
         context[1] = token.lemma
@@ -59,7 +59,7 @@ cdef inline void fill_token(atom_t* context, const TokenC* token) nogil:
         context[10] = token.ent_iob
         context[11] = token.ent_type
 
-cdef int fill_context(atom_t* ctxt, StateClass st) nogil:
+cdef int fill_context(atom_t* ctxt, const StateC* st) nogil:
     # Take care to fill every element of context!
     # We could memset, but this makes it very easy to have broken features that
     # make almost no impact on accuracy. If instead they're unset, the impact

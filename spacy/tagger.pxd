@@ -1,12 +1,17 @@
-from ._ml cimport Model
+from thinc.linear.avgtron cimport AveragedPerceptron
+from thinc.extra.eg cimport Example
+from thinc.structs cimport ExampleC
+
 from .structs cimport TokenC
 from .vocab cimport Vocab
 
 
+cdef class TaggerModel(AveragedPerceptron):
+    cdef void set_featuresC(self, ExampleC* eg, const TokenC* tokens, int i) except *
+ 
+
 cdef class Tagger:
     cdef readonly Vocab vocab
-    cdef readonly Model model
+    cdef readonly TaggerModel model
     cdef public dict freqs
-
-    cdef int predict(self, int i, const TokenC* tokens) except -1
-    cdef int update(self, int i, const TokenC* tokens, int gold) except -1
+    cdef public object cfg

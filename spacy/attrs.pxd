@@ -14,12 +14,12 @@ cpdef enum attr_id_t:
     LIKE_EMAIL
     IS_STOP
     IS_OOV
-    
-    FLAG14 = 14
-    FLAG15
-    FLAG16
-    FLAG17
-    FLAG18
+    IS_BRACKET
+    IS_QUOTE
+    IS_LEFT_PUNCT
+    IS_RIGHT_PUNCT
+
+    FLAG18 = 18
     FLAG19
     FLAG20
     FLAG21
@@ -85,3 +85,5 @@ cpdef enum attr_id_t:
     HEAD
     SPACY
     PROB
+
+    LANG

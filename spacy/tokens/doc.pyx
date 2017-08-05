@@ -1,26 +1,35 @@
-cimport cython
-from libc.string cimport memcpy, memset
-from libc.stdint cimport uint32_t
+# coding: utf8
+from __future__ import unicode_literals
 
+cimport cython
+cimport numpy as np
 import numpy
 import numpy.linalg
 import struct
-cimport numpy as np
-import math
 
+from libc.string cimport memcpy, memset
+from libc.stdint cimport uint32_t
+from libc.math cimport sqrt
+
+from .span cimport Span
+from .token cimport Token
 from ..lexeme cimport Lexeme
 from ..lexeme cimport EMPTY_LEXEME
 from ..typedefs cimport attr_t, flags_t
 from ..attrs cimport attr_id_t
 from ..attrs cimport ID, ORTH, NORM, LOWER, SHAPE, PREFIX, SUFFIX, LENGTH, CLUSTER
 from ..attrs cimport POS, LEMMA, TAG, DEP, HEAD, SPACY, ENT_IOB, ENT_TYPE
-from ..parts_of_speech cimport CONJ, PUNCT, NOUN
+from ..parts_of_speech cimport CCONJ, PUNCT, NOUN
 from ..parts_of_speech cimport univ_pos_t
 from ..lexeme cimport Lexeme
-from .spans cimport Span
+from .span cimport Span
 from .token cimport Token
+from .printers import parse_tree
 from ..serialize.bits cimport BitArray
 from ..util import normalize_slice
+from ..syntax.iterators import CHUNKERS
+from ..compat import is_config
+from .. import about
 
 
 DEF PADDING = 5
@@ -56,10 +65,45 @@ cdef attr_t get_token_attr(const TokenC* token, attr_id_t feat_name) nogil:
 
 cdef class Doc:
     """
-    Container class for annotated text.  Constructed via English.__call__ or
-    Tokenizer.__call__.
+    A sequence of `Token` objects. Access sentences and named entities,
+    export annotations to numpy arrays, losslessly serialize to compressed
+    binary strings.
+
+    Aside: Internals
+        The `Doc` object holds an array of `TokenC` structs.
+        The Python-level `Token` and `Span` objects are views of this
+        array, i.e. they don't own the data themselves.
+
+    Code: Construction 1
+        doc = nlp.tokenizer(u'Some text')
+
+    Code: Construction 2
+        doc = Doc(nlp.vocab, orths_and_spaces=[(u'Some', True), (u'text', True)])
+
     """
-    def __init__(self, Vocab vocab, orths_and_spaces=None):
+    def __init__(self, Vocab vocab, words=None, spaces=None, orths_and_spaces=None):
+        """
+        Create a Doc object.
+
+        Aside: Implementation
+            This method of constructing a `Doc` object is usually only used
+            for deserialization. Standard usage is to construct the document via
+            a call to the language object.
+
+        Arguments:
+            vocab:
+                A Vocabulary object, which must match any models you want to
+                use (e.g. tokenizer, parser, entity recognizer).
+
+            words:
+                A list of unicode strings to add to the document as words. If None,
+                defaults to empty list.
+
+            spaces:
+                A list of boolean values, of the same length as words. True
+                means that the word is followed by a space, False means it is not.
+                If None, defaults to [True]*len(words)
+        """
         self.vocab = vocab
         size = 20
         self.mem = Pool()
@@ -72,19 +116,68 @@ cdef class Doc:
             data_start[i].lex = &EMPTY_LEXEME
             data_start[i].l_edge = i
             data_start[i].r_edge = i
-        self.data = data_start + PADDING
+        self.c = data_start + PADDING
         self.max_length = size
         self.length = 0
         self.is_tagged = False
         self.is_parsed = False
+        self.sentiment = 0.0
+        self.user_hooks = {}
+        self.user_token_hooks = {}
+        self.user_span_hooks = {}
+        self.tensor = numpy.zeros((0,), dtype='float32')
+        self.user_data = {}
         self._py_tokens = []
         self._vector = None
+        self.noun_chunks_iterator = CHUNKERS.get(self.vocab.lang)
+        cdef unicode orth
+        cdef bint has_space
+        if orths_and_spaces is None and words is not None:
+            if spaces is None:
+                spaces = [True] * len(words)
+            elif len(spaces) != len(words):
+                raise ValueError(
+                    "Arguments 'words' and 'spaces' should be sequences of the "
+                    "same length, or 'spaces' should be left default at None. "
+                    "spaces should be a sequence of booleans, with True meaning "
+                    "that the word owns a ' ' character following it.")
+            orths_and_spaces = zip(words, spaces)
+        if orths_and_spaces is not None:
+            for orth_space in orths_and_spaces:
+                if isinstance(orth_space, unicode):
+                    orth = orth_space
+                    has_space = True
+                elif isinstance(orth_space, bytes):
+                    raise ValueError(
+                        "orths_and_spaces expects either List(unicode) or "
+                        "List((unicode, bool)). Got bytes instance: %s" % (str(orth_space)))
+                else:
+                    orth, has_space = orth_space
+                # Note that we pass self.mem here --- we have ownership, if LexemeC
+                # must be created.
+                self.push_back(
+                    <const LexemeC*>self.vocab.get(self.mem, orth), has_space)
+        # Tough to decide on policy for this. Is an empty doc tagged and parsed?
+        # There's no information we'd like to add to it, so I guess so?
+        if self.length == 0:
+            self.is_tagged = True
+            self.is_parsed = True
 
     def __getitem__(self, object i):
-        """Get a Token or a Span from the Doc.
-
-        Returns:
-            token (Token) or span (Span):
+        """
+        doc[i]
+            Get the Token object at position i, where i is an integer.
+            Negative indexing is supported, and follows the usual Python
+            semantics, i.e. doc[-2] is doc[len(doc) - 2].
+        doc[start : end]]
+            Get a `Span` object, starting at position `start`
+            and ending at position `end`, where `start` and
+            `end` are token indices. For instance,
+            `doc[2:5]` produces a span consisting of
+            tokens 2, 3 and 4. Stepped slices (e.g. `doc[start : end : step]`)
+            are not supported, as `Span` objects must be contiguous (cannot have gaps).
+            You can use negative indices and open-ended ranges, which have their
+            normal Python semantics.
         """
         if isinstance(i, slice):
             start, stop = normalize_slice(len(self), i.start, i.stop, i.step)
@@ -96,46 +189,92 @@ cdef class Doc:
         if self._py_tokens[i] is not None:
             return self._py_tokens[i]
         else:
-            return Token.cinit(self.vocab, &self.data[i], i, self)
+            return Token.cinit(self.vocab, &self.c[i], i, self)
 
     def __iter__(self):
-        """Iterate over the tokens.
-
-        Yields:
-            token (Token):
+        """
+        for token in doc
+            Iterate over `Token`  objects, from which the annotations can
+            be easily accessed. This is the main way of accessing Token
+            objects, which are the main way annotations are accessed from
+            Python. If faster-than-Python speeds are required, you can
+            instead access the annotations as a numpy array, or access the
+            underlying C data directly from Cython.
         """
         cdef int i
         for i in range(self.length):
             if self._py_tokens[i] is not None:
                 yield self._py_tokens[i]
             else:
-                yield Token.cinit(self.vocab, &self.data[i], i, self)
+                yield Token.cinit(self.vocab, &self.c[i], i, self)
 
     def __len__(self):
+        """
+        len(doc)
+            The number of tokens in the document.
+        """
         return self.length
 
     def __unicode__(self):
-        return u''.join([t.string for t in self])
+        return u''.join([t.text_with_ws for t in self])
+
+    def __bytes__(self):
+        return u''.join([t.text_with_ws for t in self]).encode('utf-8')
 
     def __str__(self):
-        return u''.join([t.string for t in self])
+        if is_config(python3=True):
+            return self.__unicode__()
+        return self.__bytes__()
 
     def __repr__(self):
-        return u''.join([t.string for t in self])
+        return self.__str__()
+
+    @property
+    def doc(self):
+        return self
 
     def similarity(self, other):
+        """
+        Make a semantic similarity estimate. The default estimate is cosine
+        similarity using an average of word vectors.
+
+        Arguments:
+            other (object): The object to compare with. By default, accepts Doc,
+                Span, Token and Lexeme objects.
+
+        Return:
+            score (float): A scalar similarity score. Higher is more similar.
+        """
+        if 'similarity' in self.user_hooks:
+            return self.user_hooks['similarity'](self, other)
         if self.vector_norm == 0 or other.vector_norm == 0:
             return 0.0
         return numpy.dot(self.vector, other.vector) / (self.vector_norm * other.vector_norm)
 
-    property repvec:
+    property has_vector:
+        """
+        A boolean value indicating whether a word vector is associated with the object.
+        """
         def __get__(self):
-            return self.vector
+            if 'has_vector' in self.user_hooks:
+                return self.user_hooks['has_vector'](self)
+
+            return any(token.has_vector for token in self)
 
     property vector:
+        """
+        A real-valued meaning representation. Defaults to an average of the token vectors.
+
+        Type: numpy.ndarray[ndim=1, dtype='float32']
+        """
         def __get__(self):
+            if 'vector' in self.user_hooks:
+                return self.user_hooks['vector'](self)
             if self._vector is None:
-                self._vector = sum(t.vector for t in self) / len(self)
+                if len(self):
+                    self._vector = sum(t.vector for t in self) / len(self)
+                else:
+                    return numpy.zeros((self.vocab.vectors_length,), dtype='float32')
             return self._vector
 
         def __set__(self, value):
@@ -143,49 +282,62 @@ cdef class Doc:
 
     property vector_norm:
         def __get__(self):
+            if 'vector_norm' in self.user_hooks:
+                return self.user_hooks['vector_norm'](self)
             cdef float value
+            cdef double norm = 0
             if self._vector_norm is None:
-                self._vector_norm = 1e-20
+                norm = 0.0
                 for value in self.vector:
-                    self._vector_norm += value * value
-                self._vector_norm = math.sqrt(self._vector_norm)
+                    norm += value * value
+                self._vector_norm = sqrt(norm) if norm != 0 else 0
             return self._vector_norm
-        
+
         def __set__(self, value):
-            self._vector_norm = value 
+            self._vector_norm = value
 
     @property
     def string(self):
-        return u''.join([t.string for t in self])
+        return self.text
 
-    @property
-    def text_wth_ws(self):
-        return u''.join([t.text_with_ws for t in self])
+    property text:
+        """
+        A unicode representation of the document text.
+        """
+        def __get__(self):
+            return u''.join(t.text_with_ws for t in self)
 
-    @property
-    def text(self):
-        return u' '.join(t.text for t in self)
+    property text_with_ws:
+        """
+        An alias of Doc.text, provided for duck-type compatibility with Span and Token.
+        """
+        def __get__(self):
+            return self.text
 
     property ents:
-        def __get__(self):
-            """Yields named-entity Span objects.
-        
-            Iterate over the span to get individual Token objects, or access the label:
+        """
+        Yields named-entity `Span` objects, if the entity recognizer
+        has been applied to the document. Iterate over the span to get
+        individual Token objects, or access the label:
 
-            >>> from spacy.en import English
-            >>> nlp = English()
-            >>> tokens = nlp(u'Mr. Best flew to New York on Saturday morning.')
-            >>> ents = list(tokens.ents)
-            >>> ents[0].label, ents[0].label_, ''.join(t.orth_ for t in ents[0])
-            (112504, u'PERSON', u'Best ') 
-            """
+        Example:
+            from spacy.en import English
+            nlp = English()
+            tokens = nlp(u'Mr. Best flew to New York on Saturday morning.')
+            ents = list(tokens.ents)
+            assert ents[0].label == 346
+            assert ents[0].label_ == 'PERSON'
+            assert ents[0].orth_ == 'Best'
+            assert ents[0].text == 'Mr. Best'
+        """
+        def __get__(self):
             cdef int i
             cdef const TokenC* token
             cdef int start = -1
             cdef int label = 0
             output = []
             for i in range(self.length):
-                token = &self.data[i]
+                token = &self.c[i]
                 if token.ent_iob == 1:
                     assert start != -1
                 elif token.ent_iob == 2 or token.ent_iob == 0:
@@ -210,66 +362,100 @@ cdef class Doc:
             # 4. Test more nuanced date and currency regex
             cdef int i
             for i in range(self.length):
-                self.data[i].ent_type = 0
-                self.data[i].ent_iob = 0
+                self.c[i].ent_type = 0
+                # At this point we don't know whether the NER has run over the
+                # Doc. If the ent_iob is missing, leave it missing.
+                if self.c[i].ent_iob != 0:
+                    self.c[i].ent_iob = 2 # Means O. Non-O are set from ents.
             cdef attr_t ent_type
             cdef int start, end
-            for ent_type, start, end in ents:
+            for ent_info in ents:
+                if isinstance(ent_info, Span):
+                    ent_id = ent_info.ent_id
+                    ent_type = ent_info.label
+                    start = ent_info.start
+                    end = ent_info.end
+                elif len(ent_info) == 3:
+                    ent_type, start, end = ent_info
+                else:
+                    ent_id, ent_type, start, end = ent_info
                 if ent_type is None or ent_type < 0:
                     # Mark as O
                     for i in range(start, end):
-                        self.data[i].ent_type = 0
-                        self.data[i].ent_iob = 2
+                        self.c[i].ent_type = 0
+                        self.c[i].ent_iob = 2
                 else:
                     # Mark (inside) as I
                     for i in range(start, end):
-                        self.data[i].ent_type = ent_type
-                        self.data[i].ent_iob = 1
+                        self.c[i].ent_type = ent_type
+                        self.c[i].ent_iob = 1
                     # Set start as B
-                    self.data[start].ent_iob = 3
+                    self.c[start].ent_iob = 3
 
-    @property
-    def noun_chunks(self):
-        """Yield spans for base noun phrases."""
-        if not self.is_parsed:
-            raise ValueError(
-                "noun_chunks requires the dependency parse, which "
-                "requires data to be installed. If you haven't done so, run: "
-                "\npython -m spacy.en.download all\n"
-                "to install the data")
- 
-        cdef const TokenC* word
-        labels = ['nsubj', 'dobj', 'nsubjpass', 'pcomp', 'pobj', 'attr', 'conj']
-        np_deps = [self.vocab.strings[label] for label in labels]
-        np_label = self.vocab.strings['NP']
-        for i in range(self.length):
-            word = &self.data[i]
-            if word.pos == NOUN and word.dep in np_deps:
-                yield Span(self, word.l_edge, i+1, label=np_label)
+    property noun_chunks:
+        """
+        Yields base noun-phrase #[code Span] objects, if the document
+        has been syntactically parsed. A base noun phrase, or
+        'NP chunk', is a noun phrase that does not permit other NPs to
+        be nested within it – so no NP-level coordination, no prepositional
+        phrases, and no relative clauses.
+        """
+        def __get__(self):
+            if not self.is_parsed:
+                raise ValueError(
+                    "noun_chunks requires the dependency parse, which "
+                    "requires data to be installed. For more info, see the "
+                    "documentation: \n%s\n" % about.__docs_models__)
+            # Accumulate the result before beginning to iterate over it. This prevents
+            # the tokenisation from being changed out from under us during the iteration.
+            # The tricky thing here is that Span accepts its tokenisation changing,
+            # so it's okay once we have the Span objects. See Issue #375
+            spans = []
+            for start, end, label in self.noun_chunks_iterator(self):
+                spans.append(Span(self, start, end, label=label))
+            for span in spans:
+                yield span
 
-    @property
-    def sents(self):
+    property sents:
         """
-        Yield a list of sentence Span objects, calculated from the dependency parse.
+        Yields sentence `Span` objects. Sentence spans have no label.
+        To improve accuracy on informal texts, spaCy calculates sentence
+        boundaries from the syntactic dependency parse. If the parser is disabled,
+        `sents` iterator will be unavailable.
+
+        Example:
+            from spacy.en import English
+            nlp = English()
+            doc = nlp("This is a sentence. Here's another...")
+            assert [s.root.orth_ for s in doc.sents] == ["is", "'s"]
         """
-        if not self.is_parsed:
-            raise ValueError(
-                "sentence boundary detection requires the dependency parse, which "
-                "requires data to be installed. If you haven't done so, run: "
-                "\npython -m spacy.en.download all\n"
-                "to install the data")
-        cdef int i
-        start = 0
-        for i in range(1, self.length):
-            if self.data[i].sent_start:
-                yield Span(self, start, i)
-                start = i
-        yield Span(self, start, self.length)
+        def __get__(self):
+            if 'sents' in self.user_hooks:
+                yield from self.user_hooks['sents'](self)
+                return
+
+            if not self.is_parsed:
+                raise ValueError(
+                    "Sentence boundary detection requires the dependency parse, which "
+                    "requires data to be installed. For more info, see the "
+                    "documentation: \n%s\n" % about.__docs_models__)
+            cdef int i
+            start = 0
+            for i in range(1, self.length):
+                if self.c[i].sent_start:
+                    yield Span(self, start, i)
+                    start = i
+            if start != self.length:
+                yield Span(self, start, self.length)
 
     cdef int push_back(self, LexemeOrToken lex_or_tok, bint has_space) except -1:
+        if self.length == 0:
+            # Flip these to false when we see the first token.
+            self.is_tagged = False
+            self.is_parsed = False
         if self.length == self.max_length:
             self._realloc(self.length * 2)
-        cdef TokenC* t = &self.data[self.length]
+        cdef TokenC* t = &self.c[self.length]
         if LexemeOrToken is const_TokenC_ptr:
             t[0] = lex_or_tok[0]
         else:
@@ -288,8 +474,16 @@ cdef class Doc:
 
     @cython.boundscheck(False)
     cpdef np.ndarray to_array(self, object py_attr_ids):
-        """Given a list of M attribute IDs, export the tokens to a numpy ndarray
-        of shape N*M, where N is the length of the sentence.
+        """
+        Given a list of M attribute IDs, export the tokens to a numpy
+        `ndarray` of shape (N, M), where `N` is the length
+        of the document. The values will be 32-bit integers.
+
+        Example:
+            from spacy import attrs
+            doc = nlp(text)
+            # All strings mapped to integers, for easy export to numpy
+            np_array = doc.to_array([attrs.LOWER, attrs.POS, attrs.ENT_TYPE, attrs.IS_ALPHA])
 
         Arguments:
             attr_ids (list[int]): A list of attribute ID ints.
@@ -308,28 +502,36 @@ cdef class Doc:
         output = numpy.ndarray(shape=(self.length, len(attr_ids)), dtype=numpy.int32)
         for i in range(self.length):
             for j, feature in enumerate(attr_ids):
-                output[i, j] = get_token_attr(&self.data[i], feature)
+                output[i, j] = get_token_attr(&self.c[i], feature)
         return output
 
     def count_by(self, attr_id_t attr_id, exclude=None, PreshCounter counts=None):
-        """Produce a dict of {attribute (int): count (ints)} frequencies, keyed
+        """
+        Produce a dict of {attribute (int): count (ints)} frequencies, keyed
         by the values of the given attribute ID.
 
-        >>> from spacy.en import English, attrs
-        >>> nlp = English()
-        >>> tokens = nlp(u'apple apple orange banana')
-        >>> tokens.count_by(attrs.ORTH)
-        {12800L: 1, 11880L: 2, 7561L: 1}
-        >>> tokens.to_array([attrs.ORTH])
-        array([[11880],
-               [11880],
-               [ 7561],
-               [12800]])
+        Example:
+            from spacy.en import English
+            from spacy import attrs
+            nlp = English()
+            tokens = nlp(u'apple apple orange banana')
+            tokens.count_by(attrs.ORTH)
+            # {12800L: 1, 11880L: 2, 7561L: 1}
+            tokens.to_array([attrs.ORTH])
+            # array([[11880],
+            #   [11880],
+            #   [ 7561],
+            #   [12800]])
+
+        Arguments:
+            attr_id
+                int
+                The attribute ID to key the counts.
         """
         cdef int i
         cdef attr_t attr
         cdef size_t count
-        
+
         if counts is None:
             counts = PreshCounter()
             output_dict = True
@@ -338,11 +540,11 @@ cdef class Doc:
         # Take this check out of the loop, for a bit of extra speed
         if exclude is None:
             for i in range(self.length):
-                counts.inc(get_token_attr(&self.data[i], attr_id), 1)
+                counts.inc(get_token_attr(&self.c[i], attr_id), 1)
         else:
             for i in range(self.length):
                 if not exclude(self[i]):
-                    attr = get_token_attr(&self.data[i], attr_id)
+                    attr = get_token_attr(&self.c[i], attr_id)
                     counts.inc(attr, 1)
         if output_dict:
             return dict(counts)
@@ -355,31 +557,32 @@ cdef class Doc:
         # words out-of-bounds, and get out-of-bounds markers.
         # Now that we want to realloc, we need the address of the true start,
         # so we jump the pointer back PADDING places.
-        cdef TokenC* data_start = self.data - PADDING
+        cdef TokenC* data_start = self.c - PADDING
         data_start = <TokenC*>self.mem.realloc(data_start, n * sizeof(TokenC))
-        self.data = data_start + PADDING
+        self.c = data_start + PADDING
         cdef int i
         for i in range(self.length, self.max_length + PADDING):
-            self.data[i].lex = &EMPTY_LEXEME
+            self.c[i].lex = &EMPTY_LEXEME
 
-    cdef int set_parse(self, const TokenC* parsed) except -1:
+    cdef void set_parse(self, const TokenC* parsed) nogil:
         # TODO: This method is fairly misleading atm. It's used by Parser
         # to actually apply the parse calculated. Need to rethink this.
 
         # Probably we should use from_array?
         self.is_parsed = True
         for i in range(self.length):
-            self.data[i] = parsed[i]
-            assert self.data[i].l_edge <= i
-            assert self.data[i].r_edge >= i
+            self.c[i] = parsed[i]
 
     def from_array(self, attrs, array):
+        """
+        Write to a `Doc` object, from an `(M, N)` array of attributes.
+        """
         cdef int i, col
         cdef attr_id_t attr_id
-        cdef TokenC* tokens = self.data
+        cdef TokenC* tokens = self.c
         cdef int length = len(array)
         cdef attr_t[:] values
-        for col, attr_id in enumerate(attrs): 
+        for col, attr_id in enumerate(attrs):
             values = array[:, col]
             if attr_id == HEAD:
                 for i in range(length):
@@ -390,7 +593,8 @@ cdef class Doc:
                         tokens[i + values[i]].r_kids += 1
             elif attr_id == TAG:
                 for i in range(length):
-                    tokens[i].tag = values[i]
+                    if values[i] != 0:
+                        self.vocab.morphology.assign_tag(&tokens[i], values[i])
             elif attr_id == POS:
                 for i in range(length):
                     tokens[i].pos = <univ_pos_t>values[i]
@@ -403,20 +607,46 @@ cdef class Doc:
             elif attr_id == ENT_TYPE:
                 for i in range(length):
                     tokens[i].ent_type = values[i]
-        set_children_from_heads(self.data, self.length)
+            else:
+                raise ValueError("Unknown attribute ID: %d" % attr_id)
+        set_children_from_heads(self.c, self.length)
+        self.is_parsed = bool(HEAD in attrs or DEP in attrs)
+        self.is_tagged = bool(TAG in attrs or POS in attrs)
         return self
 
     def to_bytes(self):
+        """
+        Serialize, producing a byte string.
+        """
         byte_string = self.vocab.serializer.pack(self)
         cdef uint32_t length = len(byte_string)
         return struct.pack('I', length) + byte_string
 
     def from_bytes(self, data):
+        """
+        Deserialize, loading from bytes.
+        """
         self.vocab.serializer.unpack_into(data[4:], self)
         return self
-    
+
     @staticmethod
     def read_bytes(file_):
+        """
+        A static method, used to read serialized #[code Doc] objects from
+        a file. For example:
+
+        Example:
+            from spacy.tokens.doc import Doc
+            loc = 'test_serialize.bin'
+            with open(loc, 'wb') as file_:
+                file_.write(nlp(u'This is a document.').to_bytes())
+                file_.write(nlp(u'This is another.').to_bytes())
+            docs = []
+            with open(loc, 'rb') as file_:
+                for byte_string in Doc.read_bytes(file_):
+                    docs.append(Doc(nlp.vocab).from_bytes(byte_string))
+            assert len(docs) == 2
+        """
         keep_reading = True
         while keep_reading:
             try:
@@ -429,39 +659,75 @@ cdef class Doc:
                 keep_reading = False
             yield n_bytes_str + data
 
-    # This function is terrible --- need to fix this.
-    def merge(self, int start_idx, int end_idx, unicode tag, unicode lemma,
-              unicode ent_type):
-        """Merge a multi-word expression into a single token.  Currently
-        experimental; API is likely to change."""
-        cdef int i
-        cdef int start = -1
-        cdef int end = -1
-        for i in range(self.length):
-            if self.data[i].idx == start_idx:
-                start = i
-            if (self.data[i].idx + self.data[i].lex.length) == end_idx:
-                if start == -1:
-                    return None
-                end = i + 1
-                break
-        else:
-            return None
+    def merge(self, int start_idx, int end_idx, *args, **attributes):
+        """
+        Retokenize the document, such that the span at doc.text[start_idx : end_idx]
+        is merged into a single token. If start_idx and end_idx do not mark start
+        and end token boundaries, the document remains unchanged.
 
+        Arguments:
+            start_idx (int): The character index of the start of the slice to merge.
+            end_idx (int): The character index after the end of the slice to merge.
+            **attributes:
+                Attributes to assign to the merged token. By default, attributes
+                are inherited from the syntactic root token of the span.
+        Returns:
+            token (Token):
+                The newly merged token, or None if the start and end indices did
+                not fall at token boundaries.
+        """
+        cdef unicode tag, lemma, ent_type
+        if len(args) == 3:
+            # TODO: Warn deprecation
+            tag, lemma, ent_type = args
+            attributes[TAG] = self.vocab.strings[tag]
+            attributes[LEMMA] = self.vocab.strings[lemma]
+            attributes[ENT_TYPE] = self.vocab.strings[ent_type]
+        elif not args:
+            # TODO: This code makes little sense overall. We're still
+            # ignoring most of the attributes?
+            if "label" in attributes and 'ent_type' not in attributes:
+                if type(attributes["label"]) == int:
+                    attributes[ENT_TYPE] = attributes["label"]
+                else:
+                    attributes[ENT_TYPE] = self.vocab.strings[attributes["label"]]
+            if 'ent_type' in attributes:
+                attributes[ENT_TYPE] = attributes['ent_type']
+        elif args:
+            raise ValueError(
+                "Doc.merge received %d non-keyword arguments. "
+                "Expected either 3 arguments (deprecated), or 0 (use keyword arguments). "
+                "Arguments supplied:\n%s\n"
+                "Keyword arguments:%s\n" % (len(args), repr(args), repr(attributes)))
+
+        cdef int start = token_by_start(self.c, self.length, start_idx)
+        if start == -1:
+            return None
+        cdef int end = token_by_end(self.c, self.length, end_idx)
+        if end == -1:
+            return None
+        # Currently we have the token index, we want the range-end index
+        end += 1
         cdef Span span = self[start:end]
+        tag = self.vocab.strings[attributes.get(TAG, span.root.tag)]
+        lemma = self.vocab.strings[attributes.get(LEMMA, span.root.lemma)]
+        ent_type = self.vocab.strings[attributes.get(ENT_TYPE, span.root.ent_type)]
+        ent_id = attributes.get('ent_id', span.root.ent_id)
+        if isinstance(ent_id, basestring):
+            ent_id = self.vocab.strings[ent_id]
+
         # Get LexemeC for newly merged token
         new_orth = ''.join([t.text_with_ws for t in span])
         if span[-1].whitespace_:
             new_orth = new_orth[:-len(span[-1].whitespace_)]
         cdef const LexemeC* lex = self.vocab.get(self.mem, new_orth)
         # House the new merged token where it starts
-        cdef TokenC* token = &self.data[start]
-        # Update fields
-        token.lex = lex
-        token.spacy = self.data[end-1].spacy
-        # What to do about morphology??
-        # TODO: token.morph = ???
-        token.tag = self.vocab.strings[tag]
+        cdef TokenC* token = &self.c[start]
+        token.spacy = self.c[end-1].spacy
+        if tag in self.vocab.morphology.tag_map:
+            self.vocab.morphology.assign_tag(token, tag)
+        else:
+            token.tag = self.vocab.strings[tag]
         token.lemma = self.vocab.strings[lemma]
         if ent_type == 'O':
             token.ent_iob = 2
@@ -469,42 +735,69 @@ cdef class Doc:
         else:
             token.ent_iob = 3
             token.ent_type = self.vocab.strings[ent_type]
+        token.ent_id = ent_id
         # Begin by setting all the head indices to absolute token positions
         # This is easier to work with for now than the offsets
         # Before thinking of something simpler, beware the case where a dependency
         # bridges over the entity. Here the alignment of the tokens changes.
         span_root = span.root.i
         token.dep = span.root.dep
+        # We update token.lex after keeping span root and dep, since
+        # setting token.lex will change span.start and span.end properties
+        # as it modifies the character offsets in the doc
+        token.lex = lex
         for i in range(self.length):
-            self.data[i].head += i
+            self.c[i].head += i
         # Set the head of the merged token, and its dep relation, from the Span
-        token.head = self.data[span_root].head
+        token.head = self.c[span_root].head
         # Adjust deps before shrinking tokens
         # Tokens which point into the merged token should now point to it
         # Subtract the offset from all tokens which point to >= end
         offset = (end - start) - 1
         for i in range(self.length):
-            head_idx = self.data[i].head
+            head_idx = self.c[i].head
             if start <= head_idx < end:
-                self.data[i].head = start
+                self.c[i].head = start
             elif head_idx >= end:
-                self.data[i].head -= offset
+                self.c[i].head -= offset
         # Now compress the token array
         for i in range(end, self.length):
-            self.data[i - offset] = self.data[i]
+            self.c[i - offset] = self.c[i]
         for i in range(self.length - offset, self.length):
-            memset(&self.data[i], 0, sizeof(TokenC))
-            self.data[i].lex = &EMPTY_LEXEME
+            memset(&self.c[i], 0, sizeof(TokenC))
+            self.c[i].lex = &EMPTY_LEXEME
         self.length -= offset
         for i in range(self.length):
             # ...And, set heads back to a relative position
-            self.data[i].head -= i
+            self.c[i].head -= i
         # Set the left/right children, left/right edges
-        set_children_from_heads(self.data, self.length)
+        set_children_from_heads(self.c, self.length)
         # Clear the cached Python objects
         self._py_tokens = [None] * self.length
         # Return the merged Python object
         return self[start]
+
+    def print_tree(self, light=False, flat=False):
+        """Returns the parse trees in the JSON (Dict) format."""
+        return parse_tree(self, light=light, flat=flat)
+
+
+cdef int token_by_start(const TokenC* tokens, int length, int start_char) except -2:
+    cdef int i
+    for i in range(length):
+        if tokens[i].idx == start_char:
+            return i
+    else:
+        return -1
+
+
+cdef int token_by_end(const TokenC* tokens, int length, int end_char) except -2:
+    cdef int i
+    for i in range(length):
+        if tokens[i].idx + tokens[i].lex.length == end_char:
+            return i
+    else:
+        return -1
 
 
 cdef int set_children_from_heads(TokenC* tokens, int length) except -1:
@@ -525,7 +818,7 @@ cdef int set_children_from_heads(TokenC* tokens, int length) except -1:
             if child.l_edge < head.l_edge:
                 head.l_edge = child.l_edge
             head.l_kids += 1
-        
+
     # Set right edges --- same as above, but iterate in reverse
     for i in range(length-1, -1, -1):
         child = &tokens[i]
@@ -534,3 +827,9 @@ cdef int set_children_from_heads(TokenC* tokens, int length) except -1:
             if child.r_edge > head.r_edge:
                 head.r_edge = child.r_edge
             head.r_kids += 1
+
+    # Set sentence starts
+    for i in range(length):
+        if tokens[i].head == 0 and tokens[i].dep != 0:
+            tokens[tokens[i].l_edge].sent_start = True
+

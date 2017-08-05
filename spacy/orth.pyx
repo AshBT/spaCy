@@ -1,23 +1,9 @@
-# -*- coding: utf8 -*-
+# cython: infer_types=True
+# coding: utf8
 from __future__ import unicode_literals
+
 import unicodedata
-
-# If your license is not GPL compatible, use text_unidecode. But if your code
-# is, you should use the unidecode library, because its performance is better.
-# spaCy does not list unidecode as a dependency, in case your license is not
-# GPL compatible.
-try:
-    from unidecode import unidecode
-except ImportError:
-    from text_unidecode import unidecode
-
-
 import re
-
-import math
-
-
-TAGS = 'adj adp adv conj det noun num pdt pos pron prt punct verb'.upper().split()
 
 
 # Binary string features
@@ -47,6 +33,26 @@ cpdef bint is_ascii(unicode string):
             return False
     else:
         return True
+
+
+cpdef bint is_bracket(unicode string):
+    brackets = ('(',')','[',']','{','}','<','>')
+    return string in brackets
+
+
+cpdef bint is_quote(unicode string):
+    quotes = ('"',"'",'`','«','»','‘','’','‚','‛','“','”','„','‟','‹','›','❮','❯',"''",'``')
+    return string in quotes
+
+
+cpdef bint is_left_punct(unicode string):
+    left_punct = ('(','[','{','<','"',"'",'«','‘','‚','‛','“','„','‟','‹','❮','``')
+    return string in left_punct
+
+
+cpdef bint is_right_punct(unicode string):
+    right_punct = (')',']','}','>','"',"'",'»','’','”','›','❯',"''")
+    return string in right_punct
 
 
 cpdef bint is_title(unicode string):
@@ -103,11 +109,12 @@ cpdef bint like_url(unicode string):
 
 
 # TODO: This should live in the language.orth
-NUM_WORDS = set('zero one two three four five six seven eight nine ten'
-                'eleven twelve thirteen fourteen fifteen sixteen seventeen'
-                'eighteen nineteen twenty thirty forty fifty sixty seventy'
-                'eighty ninety hundred thousand million billion trillion'
-                'quadrillion gajillion bazillion'.split())
+NUM_WORDS = set('''
+zero one two three four five six seven eight nine ten eleven twelve thirteen
+fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty
+sixty seventy eighty ninety hundred thousand million billion trillion
+quadrillion gajillion bazillion
+'''.split())
 cpdef bint like_number(unicode string):
     string = string.replace(',', '')
     string = string.replace('.', '')
@@ -153,44 +160,3 @@ cpdef unicode word_shape(unicode string):
         if seq < 4:
             shape.append(shape_char)
     return ''.join(shape)
-
-
-cpdef unicode norm1(unicode string, lower_pc=0.0, upper_pc=0.0, title_pc=0.0):
-    """Apply level 1 normalization:
-
-    * Case is canonicalized, using frequency statistics
-    * Unicode mapped to ascii, via unidecode
-    * Regional spelling variations are normalized
-    """
-    pass
-
-
-cpdef bytes asciied(unicode string):
-    stripped = unidecode(string)
-    if not stripped:
-        return b'???'
-    return stripped.encode('ascii')
-
-
-# Exceptions --- do not convert these
-_uk_us_except = set([
-    'our',
-    'ours',
-    'four',
-    'fours',
-    'your',
-    'yours',
-    'hour',
-    'hours',
-    'course',
-    'rise',
-])
-def uk_to_usa(unicode string):
-    if not string.islower():
-        return string
-    if string in _uk_us_except:
-        return string
-    our = re.compile(r'ours?$')
-    string = our.sub('or', string)
-
-    return string

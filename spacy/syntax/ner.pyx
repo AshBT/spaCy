@@ -1,16 +1,16 @@
+# coding: utf-8
 from __future__ import unicode_literals
 
+from thinc.typedefs cimport weight_t
+
+from .stateclass cimport StateClass
+from ._state cimport StateC
 from .transition_system cimport Transition
 from .transition_system cimport do_func_t
-
 from ..structs cimport TokenC, Entity
-
-from thinc.typedefs cimport weight_t
 from ..gold cimport GoldParseC
 from ..gold cimport GoldParse
 from ..attrs cimport ENT_TYPE, ENT_IOB
-
-from .stateclass cimport StateClass
 
 
 cdef enum:
@@ -20,6 +20,7 @@ cdef enum:
     LAST
     UNIT
     OUT
+    ISNT
     N_MOVES
 
 
@@ -30,6 +31,7 @@ MOVE_NAMES[IN] = 'I'
 MOVE_NAMES[LAST] = 'L'
 MOVE_NAMES[UNIT] = 'U'
 MOVE_NAMES[OUT] = 'O'
+MOVE_NAMES[ISNT] = 'x'
 
 
 cdef do_func_t[N_MOVES] do_funcs
@@ -50,20 +52,40 @@ cdef bint _entity_is_sunk(StateClass st, Transition* golds) nogil:
 
 cdef class BiluoPushDown(TransitionSystem):
     @classmethod
-    def get_labels(cls, gold_tuples):
-        move_labels = {MISSING: {'': True}, BEGIN: {}, IN: {}, LAST: {}, UNIT: {},
-                       OUT: {'': True}}
+    def get_actions(cls, **kwargs):
+        actions = kwargs.get('actions',
+                    {
+                        MISSING: [''],
+                        BEGIN: [],
+                        IN: [],
+                        LAST: [],
+                        UNIT: [],
+                        OUT: ['']
+                    })
+        seen_entities = set()
+        for entity_type in kwargs.get('entity_types', []):
+            if entity_type in seen_entities:
+                continue
+            seen_entities.add(entity_type)
+            for action in (BEGIN, IN, LAST, UNIT):
+                actions[action].append(entity_type)
         moves = ('M', 'B', 'I', 'L', 'U')
-        for raw_text, sents in gold_tuples:
+        for raw_text, sents in kwargs.get('gold_parses', []):
             for (ids, words, tags, heads, labels, biluo), _ in sents:
                 for i, ner_tag in enumerate(biluo):
                     if ner_tag != 'O' and ner_tag != '-':
                         if ner_tag.count('-') != 1:
                             raise ValueError(ner_tag)
                         _, label = ner_tag.split('-')
-                        for move_str in ('B', 'I', 'L', 'U'):
-                            move_labels[moves.index(move_str)][label] = True
-        return move_labels
+                        if label not in seen_entities:
+                            seen_entities.add(label)
+                            for move_str in ('B', 'I', 'L', 'U'):
+                                actions[moves.index(move_str)].append(label)
+        return actions
+
+    property action_types:
+        def __get__(self):
+            return (BEGIN, IN, LAST, UNIT, OUT)
 
     def move_name(self, int move, int label):
         if move == OUT:
@@ -91,16 +113,22 @@ cdef class BiluoPushDown(TransitionSystem):
                 self.freqs[ENT_TYPE][0] += 1
 
     cdef Transition lookup_transition(self, object name) except *:
-        if name == '-':
+        if name == '-' or name == None:
             move_str = 'M'
             label = 0
         elif '-' in name:
             move_str, label_str = name.split('-', 1)
+            # Hacky way to denote 'not this entity'
+            if label_str.startswith('!'):
+                label_str = label_str[1:]
+                move_str = 'x'
             label = self.strings[label_str]
         else:
             move_str = name
             label = 0
         move = MOVE_NAMES.index(move_str)
+        if move == ISNT:
+            return Transition(clas=0, move=ISNT, label=label, score=0)
         for i in range(self.n_moves):
             if self.c[i].move == move and self.c[i].label == label:
                 return self.c[i]
@@ -143,24 +171,34 @@ cdef class BiluoPushDown(TransitionSystem):
             raise Exception(move)
         return t
 
+    cdef int initialize_state(self, StateC* st) nogil:
+        # This is especially necessary when we use limited training data.
+        for i in range(st.length):
+            if st._sent[i].ent_type != 0:
+                with gil:
+                    self.add_action(BEGIN, st._sent[i].ent_type)
+                    self.add_action(IN, st._sent[i].ent_type)
+                    self.add_action(UNIT, st._sent[i].ent_type)
+                    self.add_action(LAST, st._sent[i].ent_type)
+
 
 cdef class Missing:
     @staticmethod
-    cdef bint is_valid(StateClass st, int label) nogil:
+    cdef bint is_valid(const StateC* st, int label) nogil:
         return False
 
     @staticmethod
-    cdef int transition(StateClass s, int label) nogil:
+    cdef int transition(StateC* s, int label) nogil:
         pass
 
     @staticmethod
-    cdef int cost(StateClass s, const GoldParseC* gold, int label) nogil:
+    cdef weight_t cost(StateClass s, const GoldParseC* gold, int label) nogil:
         return 9000
 
 
 cdef class Begin:
     @staticmethod
-    cdef bint is_valid(StateClass st, int label) nogil:
+    cdef bint is_valid(const StateC* st, int label) nogil:
         # Ensure we don't clobber preset entities. If no entity preset,
         # ent_iob is 0
         cdef int preset_ent_iob = st.B_(0).ent_iob
@@ -170,18 +208,28 @@ cdef class Begin:
             return False
         elif preset_ent_iob == 3 and st.B_(0).ent_type != label:
             return False
+        # If the next word is B or O, we can't B now
+        elif st.B_(1).ent_iob == 2 or st.B_(1).ent_iob == 3:
+            return False
+        # If the current word is B, and the next word isn't I, the current word
+        # is really U
+        elif preset_ent_iob == 3 and st.B_(1).ent_iob != 1:
+            return False
+        # Don't allow entities to extend across sentence boundaries
+        elif st.B_(1).sent_start:
+            return False
         else:
             return label != 0 and not st.entity_is_open()
 
     @staticmethod
-    cdef int transition(StateClass st, int label) nogil:
+    cdef int transition(StateC* st, int label) nogil:
         st.open_ent(label)
         st.set_ent_tag(st.B(0), 3, label)
         st.push()
         st.pop()
 
     @staticmethod
-    cdef int cost(StateClass s, const GoldParseC* gold, int label) nogil:
+    cdef weight_t cost(StateClass s, const GoldParseC* gold, int label) nogil:
         cdef int g_act = gold.ner[s.B(0)].move
         cdef int g_tag = gold.ner[s.B(0)].label
 
@@ -190,6 +238,9 @@ cdef class Begin:
         elif g_act == BEGIN:
             # B, Gold B --> Label match
             return label != g_tag
+        # Support partial supervision in the form of "not this label"
+        elif g_act == ISNT:
+            return label == g_tag
         else:
             # B, Gold I --> False (P)
             # B, Gold L --> False (P)
@@ -200,31 +251,35 @@ cdef class Begin:
 
 cdef class In:
     @staticmethod
-    cdef bint is_valid(StateClass st, int label) nogil:
+    cdef bint is_valid(const StateC* st, int label) nogil:
         cdef int preset_ent_iob = st.B_(0).ent_iob
         if preset_ent_iob == 2:
             return False
         elif preset_ent_iob == 3:
             return False
         # TODO: Is this quite right?
+        # I think it's supposed to be ensuring the gazetteer matches are maintained
         elif st.B_(1).ent_iob != preset_ent_iob:
             return False
+        # Don't allow entities to extend across sentence boundaries
+        elif st.B_(1).sent_start:
+            return False
         return st.entity_is_open() and label != 0 and st.E_(0).ent_type == label
-    
+
     @staticmethod
-    cdef int transition(StateClass st, int label) nogil:
+    cdef int transition(StateC* st, int label) nogil:
         st.set_ent_tag(st.B(0), 1, label)
         st.push()
         st.pop()
 
     @staticmethod
-    cdef int cost(StateClass s, const GoldParseC* gold, int label) nogil:
+    cdef weight_t cost(StateClass s, const GoldParseC* gold, int label) nogil:
         move = IN
-        cdef int next_act = gold.ner[s.B(1)].move if s.B(0) < s.length else OUT
+        cdef int next_act = gold.ner[s.B(1)].move if s.B(0) < s.c.length else OUT
         cdef int g_act = gold.ner[s.B(0)].move
         cdef int g_tag = gold.ner[s.B(0)].label
         cdef bint is_sunk = _entity_is_sunk(s, gold.ner)
-        
+
         if g_act == MISSING:
             return 0
         elif g_act == BEGIN:
@@ -248,30 +303,25 @@ cdef class In:
 
 cdef class Last:
     @staticmethod
-    cdef bint is_valid(StateClass st, int label) nogil:
-        cdef int preset_ent_iob = st.B_(0).ent_iob
-        if preset_ent_iob == 2:
+    cdef bint is_valid(const StateC* st, int label) nogil:
+        if st.B_(1).ent_iob == 1:
             return False
-        elif preset_ent_iob == 3:
-            return False
-        elif st.B_(1).ent_iob == 1:
-            return False
- 
         return st.entity_is_open() and label != 0 and st.E_(0).ent_type == label
 
     @staticmethod
-    cdef int transition(StateClass st, int label) nogil:
+    cdef int transition(StateC* st, int label) nogil:
         st.close_ent()
+        st.set_ent_tag(st.B(0), 1, label)
         st.push()
         st.pop()
 
     @staticmethod
-    cdef int cost(StateClass s, const GoldParseC* gold, int label) nogil:
+    cdef weight_t cost(StateClass s, const GoldParseC* gold, int label) nogil:
         move = LAST
 
         cdef int g_act = gold.ner[s.B(0)].move
         cdef int g_tag = gold.ner[s.B(0)].label
-        
+
         if g_act == MISSING:
             return 0
         elif g_act == BEGIN:
@@ -295,7 +345,7 @@ cdef class Last:
 
 cdef class Unit:
     @staticmethod
-    cdef bint is_valid(StateClass st, int label) nogil:
+    cdef bint is_valid(const StateC* st, int label) nogil:
         cdef int preset_ent_iob = st.B_(0).ent_iob
         if preset_ent_iob == 2:
             return False
@@ -308,7 +358,7 @@ cdef class Unit:
         return label != 0 and not st.entity_is_open()
 
     @staticmethod
-    cdef int transition(StateClass st, int label) nogil:
+    cdef int transition(StateC* st, int label) nogil:
         st.open_ent(label)
         st.close_ent()
         st.set_ent_tag(st.B(0), 3, label)
@@ -316,7 +366,7 @@ cdef class Unit:
         st.pop()
 
     @staticmethod
-    cdef int cost(StateClass s, const GoldParseC* gold, int label) nogil:
+    cdef weight_t cost(StateClass s, const GoldParseC* gold, int label) nogil:
         cdef int g_act = gold.ner[s.B(0)].move
         cdef int g_tag = gold.ner[s.B(0)].label
 
@@ -325,6 +375,9 @@ cdef class Unit:
         elif g_act == UNIT:
             # U, Gold U --> True iff tag match
             return label != g_tag
+        # Support partial supervision in the form of "not this label"
+        elif g_act == ISNT:
+            return label == g_tag
         else:
             # U, Gold B --> False
             # U, Gold I --> False
@@ -335,7 +388,7 @@ cdef class Unit:
 
 cdef class Out:
     @staticmethod
-    cdef bint is_valid(StateClass st, int label) nogil:
+    cdef bint is_valid(const StateC* st, int label) nogil:
         cdef int preset_ent_iob = st.B_(0).ent_iob
         if preset_ent_iob == 3:
             return False
@@ -344,17 +397,17 @@ cdef class Out:
         return not st.entity_is_open()
 
     @staticmethod
-    cdef int transition(StateClass st, int label) nogil:
+    cdef int transition(StateC* st, int label) nogil:
         st.set_ent_tag(st.B(0), 2, 0)
         st.push()
         st.pop()
-    
+
     @staticmethod
-    cdef int cost(StateClass s, const GoldParseC* gold, int label) nogil:
+    cdef weight_t cost(StateClass s, const GoldParseC* gold, int label) nogil:
         cdef int g_act = gold.ner[s.B(0)].move
         cdef int g_tag = gold.ner[s.B(0)].label
 
-        if g_act == MISSING:
+        if g_act == MISSING or g_act == ISNT:
             return 0
         elif g_act == BEGIN:
             # O, Gold B --> False
@@ -373,7 +426,7 @@ cdef class Out:
             return 1
         else:
             return 1
-    
+
 
 class OracleError(Exception):
     pass
